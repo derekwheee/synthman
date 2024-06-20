@@ -10,14 +10,20 @@ void SynthVoice::initialize(float sampleRate)
 {
     note = -1;
     detune = 1.0f;
+    frequency_ = 440.0f;
 
     oscillator[0].Init(sampleRate);
-    oscillator[0].SetFreq(440);
+    oscillator[0].SetFreq(frequency_);
     oscillator[0].SetAmp(1);
 
     oscillator[1].Init(sampleRate);
-    oscillator[1].SetFreq(440 * detune);
+    oscillator[1].SetFreq(frequency_ * detune);
     oscillator[1].SetAmp(1);
+
+    lfo.Init(sampleRate);
+    lfo.SetWaveform(SINE);
+    lfo.SetFreq(0.1);
+    lfo.SetAmp(0);
 
     envelope.Init(sampleRate);
 
@@ -28,23 +34,35 @@ void SynthVoice::setProfile(Profile nextProfile)
 {
     switch (nextProfile)
     {
+    case NUMBER_2:
+        oscillator[0].SetWaveform(oscillator[0].WAVE_TRI);
+        oscillator[1].SetWaveform(oscillator[1].WAVE_SQUARE);
+        detune = 1.3333f;
+        break;
     case BUZZSAW:
         oscillator[0].SetWaveform(oscillator[0].WAVE_SAW);
         oscillator[1].SetWaveform(oscillator[1].WAVE_SQUARE);
-        detune = 2.0f;
+        detune = 0.5f;
         break;
     case DEFAULT:
     default:
         oscillator[0].SetWaveform(oscillator[0].WAVE_SIN);
         oscillator[1].SetWaveform(oscillator[1].WAVE_TRI);
+        detune = 2.0f;
         break;
     }
 }
 
-void SynthVoice::setFrequency(float frequency, float vibrato)
+void SynthVoice::setFrequency()
 {
-    oscillator[0].SetFreq(frequency + vibrato);
-    oscillator[1].SetFreq((frequency * detune) + vibrato);
+    setFrequency(frequency_);
+}
+
+void SynthVoice::setFrequency(float frequency)
+{
+    frequency_ = frequency;
+    oscillator[0].SetFreq(frequency);
+    oscillator[1].SetFreq((frequency * detune));
 }
 
 void SynthVoice::trigger()
@@ -59,6 +77,14 @@ void SynthVoice::release()
 
 float SynthVoice::getSample()
 {
+    // TODO: This LFO isn't working right :(
+    // float vibrato = lfo.Process();
     float level = envelope.Process(note > -1);
-    return ((oscillator[0].Process() + oscillator[1].Process()) / 2) * level;
+
+    // setFrequency(frequency_ + vibrato);
+
+    float osc1 = oscillator[0].Process();
+    float osc2 = oscillator[1].Process();
+
+    return ((osc1 + osc2) / 2) * level;
 }

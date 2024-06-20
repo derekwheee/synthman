@@ -9,12 +9,14 @@ using namespace daisy;
 #define NUM_NOTES 127
 #define NUM_OSCILLATORS 3
 #define POLYSYNTH_VOICES 8
+#define MAX_DELAY static_cast<size_t>(48000 * 2.5f)
 
 static DaisyPod pod;
-// static Oscillator osc[NUM_OSCILLATORS];
-static Oscillator lfo;
 static MoogLadder filter;
 static Parameter pitchParam, osc2Detune, cutoffParam, resonanceParam, lfoParam;
+static ReverbSc DSY_SDRAM_BSS reverb;
+static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delayLeft;
+static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delayRight;
 
 SynthVoice voices[POLYSYNTH_VOICES];
 
@@ -30,11 +32,10 @@ enum ControlMode
 int numWaveforms = static_cast<Waveform>(__WF_COUNT);
 int numProfiles = static_cast<Profile>(__WF_COUNT);
 
-bool heldNotes[NUM_NOTES];
-float detune[NUM_OSCILLATORS];
-
 ControlMode mode;
 int wave[NUM_OSCILLATORS];
+
+float sample_rate;
 float vibrato;
 float oscFreq;
 float lfoFreq;
@@ -43,14 +44,23 @@ float attack;
 float release;
 float cutoff;
 float resonance;
+float reverbMix;
 float oldKnob1, oldKnob2, knob1, knob2;
 bool isGateHigh;
+
+// Delay
+float currentDelay;
+float delayFeedback;
+float delayTarget;
 
 float modeColorMap[4][3] = {
 	{1.0, 0.5, 0},
 	{1.0, 0, 0},
 	{0, 1.0, 0},
 	{1.0, 0, 1.0}};
+
+void getReverbSample(float in1, float in2, float &out1, float &out2);
+void getDelaySample(float in1, float in2, float &out1, float &out2);
 
 void ConditionalParameter(float oldVal,
 						  float newVal,
@@ -62,7 +72,6 @@ void Controls();
 void NextSamples(float &signal)
 {
 	float voiceSum = 0.0f;
-	vibrato = lfo.Process();
 
 	for (int i = 0; i < POLYSYNTH_VOICES; i++)
 	{
@@ -82,13 +91,16 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer input,
 	for (size_t i = 0; i < size; i += 2)
 	{
 		float signal;
+		float out1, out2;
 		NextSamples(signal);
+		getReverbSample(signal, signal, out1, out2);
+		getDelaySample(signal, signal, out1, out2);
 
 		// left output
-		output[i] = signal;
+		output[i] = out1;
 
 		// right output
-		output[i + 1] = signal;
+		output[i + 1] = out2;
 	}
 }
 
@@ -100,7 +112,7 @@ void handleNoteOn(int note, int millis)
 	{
 		if (voices[i].note == -1)
 		{
-			voices[i].setFrequency(mtof(note), vibrato);
+			voices[i].setFrequency(mtof(note));
 			voices[i].note = note;
 			voices[i].lastNoteMs = millis;
 			voices[i].trigger();
@@ -126,7 +138,7 @@ void handleNoteOn(int note, int millis)
 		}
 	}
 
-	voices[stalestVoiceIndex].setFrequency(mtof(note), vibrato);
+	voices[stalestVoiceIndex].setFrequency(mtof(note));
 	voices[stalestVoiceIndex].note = note;
 	voices[stalestVoiceIndex].lastNoteMs = millis;
 	voices[stalestVoiceIndex].trigger();
@@ -195,7 +207,8 @@ void HandleMidiMessage(MidiEvent m)
 		case 105: // detune voices
 			for (int i = 0; i < POLYSYNTH_VOICES; i++)
 			{
-				voices[i].detune = p.value / 127.0f;
+				voices[i].detune = (p.value / 127.0f) * 4.0f;
+				voices[i].setFrequency();
 			}
 			break;
 		case 97: // Cutoff
@@ -218,10 +231,28 @@ void HandleMidiMessage(MidiEvent m)
 			break;
 		case 100: // LFO Frequency
 			// TODO: Make this logarithmic
-			lfo.SetFreq((float)p.value / 127.0f * 100.0f);
+			for (int i = 0; i < POLYSYNTH_VOICES; i++)
+			{
+				voices[i].lfo.SetFreq(((float)p.value / 127.0f) * 1000.0f);
+			}
 			break;
 		case 109: // LFO Amplitude
-			lfo.SetAmp(((float)p.value / 127.0f) * 100);
+			for (int i = 0; i < POLYSYNTH_VOICES; i++)
+			{
+				voices[i].lfo.SetAmp((float)p.value / 127.0f);
+			}
+			break;
+		case 101: // Reverb mix
+			reverbMix = (float)p.value / 127.0f;
+			break;
+		case 110: // Reverb feedback
+			reverb.SetFeedback((float)p.value / 127.0f);
+			break;
+		case 102: // Delay feedback
+			delayFeedback = (float)p.value / 127.0f;
+			break;
+		case 111: // Delay time
+			currentDelay = delayTarget = sample_rate * ((float)p.value / 127.0f);
 			break;
 		default:
 			break;
@@ -235,11 +266,7 @@ void HandleMidiMessage(MidiEvent m)
 
 int main(void)
 {
-	std::fill(heldNotes, heldNotes + NUM_NOTES, false);
-	std::fill(detune, detune + NUM_OSCILLATORS, 1);
-
 	// Set global variables
-	float sample_rate;
 	mode = VCO;
 	vibrato = 0.0f;
 	oscFreq = 1000.0f;
@@ -248,36 +275,39 @@ int main(void)
 	attack = .01f;
 	release = .2f;
 	cutoff = 10000;
-	lfoAmp = 1.0f;
-	lfoFreq = 0.1f;
+	reverbMix = 0.5f;
 
 	// Init everything
 	pod.Init();
 	pod.SetAudioBlockSize(4);
 	sample_rate = pod.AudioSampleRate();
 	filter.Init(sample_rate);
-	lfo.Init(sample_rate);
 
 	// Set filter parameters
 	filter.SetFreq(10000);
 	filter.SetRes(0.8);
+
+	reverb.Init(sample_rate);
+	reverb.SetLpFreq(18000.0f);
+	reverb.SetFeedback(0.85f);
+
+	delayLeft.Init();
+	delayRight.Init();
+	currentDelay = delayTarget = sample_rate * 0.75f;
+	delayFeedback = 0.5f;
+	delayLeft.SetDelay(currentDelay);
+	delayRight.SetDelay(currentDelay);
 
 	for (int i = 0; i < POLYSYNTH_VOICES; i++)
 	{
 		voices[i].initialize(sample_rate);
 	}
 
-	// Set parameters for lfo
-	lfo.SetWaveform(SINE);
-	lfo.SetFreq(0.1);
-	lfo.SetAmp(1);
-
 	// set parameter parameters
 	cutoffParam.Init(pod.knob1, 100, 20000, cutoffParam.LOGARITHMIC);
 	resonanceParam.Init(pod.knob2, 0, 1, resonanceParam.LINEAR);
 	pitchParam.Init(pod.knob1, 50, 5000, pitchParam.LOGARITHMIC);
 	osc2Detune.Init(pod.knob2, 0.01, 2, osc2Detune.LINEAR);
-	lfoParam.Init(pod.knob1, 0.25, 1000, lfoParam.LOGARITHMIC);
 
 	// start callback
 	pod.StartAdc();
@@ -347,11 +377,11 @@ void UpdateKnobs()
 	// 	ConditionalParameter(oldKnob2, knob2, lfoAmp, pod.knob2.Process());
 	// 	lfo.SetFreq(lfoFreq);
 	// 	lfo.SetAmp(lfoAmp * 100);
-	case VCA:
-		ConditionalParameter(oldKnob1, knob1, lfoFreq, lfoParam.Process());
-		ConditionalParameter(oldKnob2, knob2, lfoAmp, pod.knob2.Process());
-		lfo.SetFreq(lfoFreq);
-		lfo.SetAmp(lfoAmp * 100);
+	// case VCA:
+	// 	ConditionalParameter(oldKnob1, knob1, lfoFreq, lfoParam.Process());
+	// 	ConditionalParameter(oldKnob2, knob2, lfoAmp, pod.knob2.Process());
+	// 	lfo.SetFreq(lfoFreq);
+	// 	lfo.SetAmp(lfoAmp * 100);
 	default:
 		break;
 	}
@@ -391,4 +421,28 @@ void Controls()
 	UpdateLeds();
 
 	UpdateButtons();
+}
+
+void getReverbSample(float in1, float in2, float &out1, float &out2)
+{
+
+	reverb.Process(in1, in2, &out1, &out2);
+	out1 = reverbMix * out1 + (1 - reverbMix) * in1;
+	out2 = reverbMix * out2 + (1 - reverbMix) * in2;
+}
+
+void getDelaySample(float in1, float in2, float &out1, float &out2)
+{
+	fonepole(currentDelay, delayTarget, .00007f);
+	delayRight.SetDelay(currentDelay);
+	delayLeft.SetDelay(currentDelay);
+
+	out1 = delayRight.Read();
+	out2 = delayLeft.Read();
+
+	delayRight.Write((delayFeedback * out1) + in1);
+	out1 = (delayFeedback * out1) + in1;
+
+	delayLeft.Write((delayFeedback * out2) + in2);
+	out2 = (delayFeedback * out2) + in2;
 }
